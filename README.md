@@ -42,6 +42,10 @@ sudo killall rpicam-vid  # Звільняємо камеру на випадок
 python web_yolo.py
 
 
+make Bacup
+scp -r pi@raspberrypi.local:/home/pi/picar_yolo ~/Desktop/Pi_Backup;
+
+
 Навчання власної моделі (Custom Dataset)
 
 Проєкт підтримує кастомні моделі YOLOv8. Пайплайн навчання виглядає так:
