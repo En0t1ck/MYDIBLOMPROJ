@@ -9,7 +9,7 @@ import threading
 import time
 import queue
 from datetime import datetime
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template_string, request
 from picarx import Picarx
 
 # --- ХАК ДЛЯ БІБЛІОТЕК ---
@@ -38,12 +38,23 @@ class RobotState:
         self.stop_timer = 0
         self.debounce_timer = 0
         self.red_light_active = False
+        self.manual_mode = False  # ✅ Флаг: ручне керування активне?
         self.lock = threading.Lock()
     
     def update_hud_status(self, msg):
         with self.lock:
             self.hud_status = msg
             logger.info(f"HUD Status: {msg}")
+    
+    def set_manual_mode(self, is_manual):
+        """Включити/вимкнути ручний режим"""
+        with self.lock:
+            self.manual_mode = is_manual
+    
+    def is_manual_mode(self):
+        """Перевірити чи активний ручний режим"""
+        with self.lock:
+            return self.manual_mode
 
 state = RobotState()
 
@@ -200,16 +211,59 @@ class YOLOProcessor:
                     self.net.setInput(blob)
                     preds = np.squeeze(self.net.forward()[0]).T
                     
+                    # Фільтрація за confidence
+                    valid_preds = []
                     for pred in preds:
                         conf = pred[4:].max()
                         if conf > CONFIDENCE_THRESHOLD:
                             cl_id = np.argmax(pred[4:])
-                            class_name = TARGET_CLASSES[cl_id]
                             x, y, w, h = pred[0]*2, pred[1]*1.5, pred[2]*2, pred[3]*1.5
+                            valid_preds.append({
+                                'x1': int(x - w/2),
+                                'y1': int(y - h/2),
+                                'x2': int(x + w/2),
+                                'y2': int(y + h/2),
+                                'conf': conf,
+                                'class_id': cl_id,
+                                'class_name': TARGET_CLASSES[cl_id]
+                            })
+                    
+                    # NMS - видалення перекриваючих боксів
+                    if valid_preds:
+                        # Сортуємо за confidence (спадаючо)
+                        valid_preds = sorted(valid_preds, key=lambda x: x['conf'], reverse=True)
+                        
+                        # NMS алгоритм
+                        keep = []
+                        for i, pred1 in enumerate(valid_preds):
+                            skip = False
+                            for pred2 in keep:
+                                # IoU обчислення
+                                x1_inter = max(pred1['x1'], pred2['x1'])
+                                y1_inter = max(pred1['y1'], pred2['y1'])
+                                x2_inter = min(pred1['x2'], pred2['x2'])
+                                y2_inter = min(pred1['y2'], pred2['y2'])
+                                
+                                if x2_inter > x1_inter and y2_inter > y1_inter:
+                                    inter = (x2_inter - x1_inter) * (y2_inter - y1_inter)
+                                    box1_area = (pred1['x2'] - pred1['x1']) * (pred1['y2'] - pred1['y1'])
+                                    box2_area = (pred2['x2'] - pred2['x1']) * (pred2['y2'] - pred2['y1'])
+                                    iou = inter / (box1_area + box2_area - inter)
+                                    
+                                    if iou > 0.5:  # NMS threshold
+                                        skip = True
+                                        break
                             
-                            detected_classes.add(class_name)
-                            detected_with_conf.append((class_name, conf))
-                            last_boxes.append(([int(x-w/2), int(y-h/2), int(w), int(h)], class_name, conf))
+                            if not skip:
+                                keep.append(pred1)
+                        
+                        # Обробляємо тільки унікальні боксі
+                        for pred in keep:
+                            detected_classes.add(pred['class_name'])
+                            detected_with_conf.append((pred['class_name'], pred['conf']))
+                            w = pred['x2'] - pred['x1']
+                            h = pred['y2'] - pred['y1']
+                            last_boxes.append(([pred['x1'], pred['y1'], w, h], pred['class_name'], pred['conf']))
                     
                     # Зберігаємо результати в кеш для всіх клієнтів
                     with self.lock:
@@ -218,9 +272,10 @@ class YOLOProcessor:
                         self.detected_classes = detected_classes
                         self.detected_with_conf = detected_with_conf
                     
-                    # Прийняття рішення
-                    speed, angle = decide_speed_and_angle(detected_classes)
-                    move_robot(speed, angle)
+                    # ✅ YOLO керує ТІЛЬКИ якщо не активний ручний режим
+                    if not state.is_manual_mode():
+                        speed, angle = decide_speed_and_angle(detected_classes)
+                        move_robot(speed, angle)
                 else:
                     # Для проміжних фреймів просто оновлюємо кеш фрейму
                     with self.lock:
@@ -272,6 +327,7 @@ SPEED_REDUCTION = {
 
 def init_robot():
     px.set_dir_servo_angle(0)
+    px.forward(0)  # ✅ ЗУПИНИТИ при старті!
     logger.info("Робот ініціалізований")
     state.update_hud_status("INIT: OK")
 
@@ -398,6 +454,7 @@ HTML_TEMPLATE = """
         #battery { top: 15px; right: 15px; font-size: 18px; font-weight: bold; }
         #status { top: 15px; left: 15px; font-size: 16px; color: #0f0; min-width: 250px; }
         #detected { bottom: 15px; left: 15px; font-size: 14px; color: #ff0; max-height: 150px; overflow-y: auto; max-width: 400px; }
+        #controls { bottom: 15px; right: 15px; font-size: 12px; color: #0ff; background: rgba(0,0,0,0.9); padding: 10px; border-radius: 5px; border: 1px solid #0ff; max-width: 250px; }
         .critical { color: #f00; font-weight: bold; }
         .warning { color: #ff0; }
         .info { color: #0f0; }
@@ -410,6 +467,7 @@ HTML_TEMPLATE = """
         <div id="status" class="hud">
             <div class="info">Status: Initializing...</div>
             <div class="info" id="speed">Speed: --</div>
+            <div class="info" id="angle">Angle: --°</div>
             <div class="info" id="timer">Timer: --</div>
         </div>
         
@@ -421,15 +479,93 @@ HTML_TEMPLATE = """
             <div style="color: #0f0; font-weight: bold;">Detected Objects:</div>
             <div id="objects" style="margin-top: 5px;">--</div>
         </div>
+        
+        <div id="controls">
+            <div style="color: #0ff; font-weight: bold; margin-bottom: 8px;">⌨️ Управління:</div>
+            <div>W / ↑ = Вперед</div>
+            <div>S / ↓ = Назад</div>
+            <div>A / ← = Вліво</div>
+            <div>D / → = Вправо</div>
+            <div style="margin-top: 5px; border-top: 1px solid #0ff; padding-top: 5px;">
+                <div style="color: #ff0;">Режим:</div>
+                <div id="mode" style="color: #0f0;">Автоматичний (YOLO)</div>
+            </div>
+        </div>
     </div>
     
     <script>
+        let manualMode = false;
+        let currentSpeed = 0;
+        let currentAngle = 0;
+        let manualTimeout = null;
+        
+        const keys = {};
+        
+        window.addEventListener('keydown', (e) => {
+            keys[e.key.toLowerCase()] = true;
+            processInput();
+        });
+        
+        window.addEventListener('keyup', (e) => {
+            keys[e.key.toLowerCase()] = false;
+            processInput();
+        });
+        
+        function processInput() {
+            let speed = 0;
+            let angle = 0;
+            let anyKeyPressed = false;
+            
+            // Визначаємо напрямок
+            if (keys['w'] || keys['arrowup']) { speed = 70; anyKeyPressed = true; }
+            if (keys['s'] || keys['arrowdown']) { speed = -70; anyKeyPressed = true; }
+            if (keys['a'] || keys['arrowleft']) { angle = -30; anyKeyPressed = true; }
+            if (keys['d'] || keys['arrowright']) { angle = 30; anyKeyPressed = true; }
+            
+            if (anyKeyPressed) {
+                // ✅ КЛАВІША НАТИСНУТА
+                manualMode = true;
+                currentSpeed = speed;
+                currentAngle = angle;
+                
+                // Відправляємо команду
+                fetch(`/control?speed=${speed}&angle=${angle}`).catch(() => {});
+                
+                // Скидаємо таймер на вимкнення
+                clearTimeout(manualTimeout);
+                manualTimeout = null;
+            } else if (manualMode && !manualTimeout) {
+                // ✅ КЛАВІШІ ВІДПУЩЕНІ але ще в ручному режимі
+                // Встановлюємо таймер на 500мс перед вимкненням
+                manualTimeout = setTimeout(() => {
+                    console.log("⏱️ Вимикаємо manual_mode");
+                    manualMode = false;
+                    fetch('/control?speed=0&angle=0').catch(() => {});
+                    manualTimeout = null;
+                }, 500);
+            }
+            
+            updateModeDisplay();
+        }
+        
+        function updateModeDisplay() {
+            const modeEl = document.getElementById('mode');
+            if (manualMode) {
+                modeEl.innerHTML = '🎮 Ручний режим (S:' + currentSpeed + ' A:' + currentAngle + '°)';
+                modeEl.style.color = '#fff';
+            } else {
+                modeEl.innerHTML = 'Автоматичний (YOLO)';
+                modeEl.style.color = '#0f0';
+            }
+        }
+        
         setInterval(() => {
             fetch('/api/status').then(r => r.json()).then(data => {
                 document.getElementById('battery').innerText = data.battery;
                 document.getElementById('status').innerHTML = 
                     `<div class="${data.hud_status.includes('STOP') ? 'critical' : data.hud_status.includes('RED') ? 'critical' : data.hud_status.includes('NORMAL') ? 'info' : 'warning'}">Status: ${data.hud_status}</div>
                      <div class="info">Speed: ${data.current_speed}</div>
+                     <div class="info">Angle: ${data.current_angle}°</div>
                      <div class="info">Timer: ${data.stop_timer > 0 ? data.stop_timer + 's' : '--'}`;
                 
                 const objList = data.detected_objects.length > 0 
@@ -455,6 +591,30 @@ def api_status():
             "debounce_timer": state.debounce_timer,
             "detected_objects": state.detected_objects
         })
+
+@app.route('/control')
+def control():
+    """Керування з клавіатури: /control?speed=70&angle=30"""
+    try:
+        speed = int(request.args.get('speed', 0))
+        angle = int(request.args.get('angle', 0))
+        
+        # Якщо натиснута клавіша (speed або angle != 0) - включаємо manual_mode
+        if speed != 0 or angle != 0:
+            state.set_manual_mode(True)
+            move_robot(speed, angle)
+            logger.info(f"🎮 Ручний режим: speed={speed}, angle={angle}°")
+        else:
+            # Якщо обидва = 0, то вимикаємо manual_mode через мікро-затримку
+            # (щоб клієнт встиг отримати відповідь)
+            state.set_manual_mode(False)
+            move_robot(0, 0)
+            logger.info("Повернення в автоматичний режим (YOLO)")
+        
+        return "ok"
+    except Exception as e:
+        logger.error(f"Помилка контролю: {e}")
+        return "error"
 
 @app.route('/action/<cmd>')
 def action(cmd):
